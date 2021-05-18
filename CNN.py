@@ -156,6 +156,253 @@ class Convolutional_Neural_Network:
         
         return cimg
         
+    
+    
+    def backprop_conv(self, loss_output, pooling_lay, weight_change):
+        
+        #CONVERT MATRIX TO FLOAT32
+        loss_output = loss_output.astype(np.float32)
+        pooling_lay = pooling_lay.astype(np.float32)
+        weight_change = weight_change.astype(np.float32)
+        
+        
+        #CREATE BUFFER FOR EACH ARRAY
+        mf = cl.mem_flags
+        cl_a = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf = loss_output.flatten())
+        cl_b = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf = pooling_lay.flatten())
+        cl_c = cl.Buffer(self.ctx, mf.WRITE_ONLY, weight_change.flatten().nbytes)
+        
+        
+        prg2 = cl.Program(self.ctx, """
+        __kernel void conv_backprop(int lmat, int pmat, int cgmat, int lrow, int lcol, int prow, int pcol, int cgrow, int cgcol, __global float * loss_out, __global float * fpool, __global float * fchange)
+        {
+
+            int i = get_global_id(0);
+            int j = get_global_id(1);
+            int k = get_global_id(2);
+            
+            fchange[(i * (cgcol * cgrow)) + (j * cgcol) + k ] = 0;
+            
+            for (int row=0; row < lrow; row++)
+            {
+                for (int col=0; col < lcol; col++)
+                {
+                        
+                    /*lmat/fpool is total loss matrices / total filter matrices*/
+                    fchange[(i * (cgcol * cgrow)) + (j * cgcol) + k ] += fpool[((i%pmat) * (pcol * prow)) + (row * pcol + col)+(j*pcol+k)] * loss_out[(i * (lrow * lcol)) +  (row * lcol) + col];
+                
+                }
+            }
+        }
+        """).build()
+        
+        #CONVERTING LOSS CHANGE/OUTPUT CHANGE DIMENSIONS TO INT32
+        if(loss_output.ndim == 3):
+            loss_output_size = np.int32(loss_output.shape[0])
+            lrow = np.int32(loss_output.shape[1])
+            lcol = np.int32(loss_output.shape[2])
+        else:
+            loss_output_size = np.int32(1)
+            lrow = np.int32(loss_output.shape[0])
+            lcol = np.int32(loss_output.shape[1])
+        
+        
+        #CONVERTING POOLING LAYER DIMENSIONS TO INT32
+        if(pooling_lay.ndim == 3):
+            pooling_lay_size = np.int32(pooling_lay.shape[0])
+            prow = np.int32(pooling_lay.shape[1])
+            pcol = np.int32(pooling_lay.shape[2])
+        else:
+            pooling_lay_size = np.int32(1)
+            prow = np.int32(pooling_lay.shape[0])
+            pcol = np.int32(pooling_lay.shape[1])
+        
+        
+        #CONVERTING FILTER WEIGHT CHANGE DIMENSIONS TO INT32
+        if(weight_change.ndim == 3):
+            weight_change_size = np.int32(weight_change.shape[0])
+            cgrow = np.int32(weight_change.shape[1])
+            cgcol = np.int32(weight_change.shape[2])
+        else:
+            weight_change_size = np.int32(1)
+            cgrow = np.int32(weight_change.shape[0])
+            cgcol = np.int32(weight_change.shape[1])
+            
+    
+        #RUN PARALLELISM ALGORITHM IN C
+        prg2.conv_backprop(self.queue, weight_change.shape ,None, loss_output_size, pooling_lay_size, weight_change_size, lrow, lcol, prow, pcol, cgrow, cgcol,cl_a, cl_b, cl_c)
+    
+    
+        #CREATE ARRAY OF CONV IMAGE FILLED WITH ZEROS
+        wchange = np.zeros_like(weight_change,dtype=np.float32)
+        wchange = np.empty_like(wchange)
+        
+        #COPY OVER PARALLELISM ALGORITHM RESULT TO CONV IMAGE ARRAY
+        cl.enqueue_copy(self.queue, wchange , cl_c)
+        
+        #SUMMING THE WEIGHT CHANGE TO HAVE SAME DIMENSIONS AS THE FILTERS
+        wchange = np.split(wchange,int(loss_output_size/pooling_lay_size))
+        wchange = np.sum(wchange,axis=1)
+        
+        return wchange
+    
+    
+    
+    def parallel_pooling(self, pre_pool, aft_pool):
+    
+        #CONVERT MATRIX TO FLOAT32
+        pre_pool = pre_pool.astype(np.float32)
+        aft_pool = aft_pool.astype(np.float32)
+        
+        mf = cl.mem_flags
+        cl_a = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf = pre_pool.flatten())
+        cl_b = cl.Buffer(self.ctx, mf.WRITE_ONLY, aft_pool.flatten().nbytes)
+        
+        prg3 = cl.Program(self.ctx, """
+        __kernel void pooling_parallelism( int pool_row, int pool_col,int prep_row, int prep_col, int aftp_row, int aftp_col,  __global float * pre_pool, __global float * aft_pool)
+        {
+
+            int i = get_global_id(0);
+            int j = get_global_id(1);
+            int k = get_global_id(2);
+            
+            aft_pool[(i * (aftp_col * aftp_row)) + (j * aftp_col) + k ] = 0;
+
+            for (int row=0; row < pool_row; row++)
+            {
+                for (int col=0; col < pool_col; col++)
+                {
+
+                    if( aft_pool[(i * (aftp_col * aftp_row)) + (j * aftp_col) + k ] <= pre_pool[((i * (prep_col * prep_row)) + (row * prep_col + col)+(j*pool_row*prep_col+k*pool_col))])
+                    {
+                        aft_pool[(i * (aftp_col * aftp_row)) + (j * aftp_col) + k ] = pre_pool[((i * (prep_col * prep_row)) + (row * prep_col + col)+(j*pool_row*prep_col+k*pool_col))];
+                    }
+                }
+            }
+        }
+        """).build()
+        
+        
+        #CONVERTING PRE POOLING LAYER DIMENSIONS TO INT32
+        if(pre_pool.ndim == 3):
+            pre_pool_size = np.int32(pre_pool.shape[0])
+            prep_row = np.int32(pre_pool.shape[1])
+            prep_col = np.int32(pre_pool.shape[2])
+        else:
+            pooling_lay_size = np.int32(1)
+            prep_row = np.int32(pre_pool.shape[0])
+            prep_col = np.int32(pre_pool.shape[1])
+        
+        
+        #CONVERTING AFTER POOLING LAYER DIMENSIONS TO INT32
+        if(aft_pool.ndim == 3):
+            aft_pool_size = np.int32(aft_pool.shape[0])
+            aftp_row = np.int32(aft_pool.shape[1])
+            aftp_col = np.int32(aft_pool.shape[2])
+        else:
+            aft_pool_size = np.int32(1)
+            aftp_row = np.int32(aft_pool.shape[0])
+            aftp_col = np.int32(aft_pool.shape[1])
+            
+            
+            
+        #RUN PARALLELISM ALGORITHM IN C
+        prg3.pooling_parallelism(self.queue, aft_pool.shape ,None, np.int32(self.pool_length), np.int32(self.pool_height), prep_row, prep_col, aftp_row, aftp_col, cl_a, cl_b)
+    
+        #COPY OVER PARALLELISM ALGORITHM RESULT TO CONV IMAGE ARRAY
+        cl.enqueue_copy(self.queue, aft_pool , cl_b)
+        
+        
+        return aft_pool
+    
+        
+    def conv_backprop_loss(self, oloss_out, ofilter, new_lo_output):
+        
+        #CONVERT MATRIX TO FLOAT32
+        oloss_out = oloss_out.astype(np.float32)
+        ofilter = ofilter.astype(np.float32)
+        new_lo_output = new_lo_output.astype(np.float32)
+        
+        #CREATE BUFFER FOR EACH ARRAY
+        mf = cl.mem_flags
+        cl_a = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf = oloss_out.flatten())
+        cl_b = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf = ofilter.flatten())
+        cl_c = cl.Buffer(self.ctx, mf.WRITE_ONLY, new_lo_output.flatten().nbytes)
+        
+        
+        prg4 = cl.Program(self.ctx, """
+        __kernel void conv_backprop_loss_o(int olmat, int fmat, int nlmat, int olrow, int olcol, int frow, int fcol, int nlrow, int nlcol, __global float * loss_out, __global float * ffilter, __global float * new_lo_output)
+        {
+
+            int i = get_global_id(0);
+            int j = get_global_id(1);
+            int k = get_global_id(2);
+
+            new_lo_output[(i * (nlcol * nlrow)) + (j * nlcol) + k ] = 0;
+
+            for (int row=0; row < frow; row++)
+            {
+                for (int col=0; col < fcol; col++)
+                {
+
+                    /*lmat/fpool is total loss matrices / total filter matrices*/
+                    new_lo_output[(i * (nlcol * nlrow)) + (j * nlcol) + k ] += loss_out[(i * (olcol * olrow)) + (row * olcol + col)+(j*olcol+k)] * ffilter[((i/(olmat/fmat)) * (frow * fcol)) +  (row * fcol) + col];
+
+                }
+            }
+        }
+        """).build()
+        
+        
+        #CONVERTING ORIGINAL LOSS CHANGE/OUTPUT DIMENSIONS TO INT32
+        if(oloss_out.ndim == 3):
+            oloss_out_size = np.int32(oloss_out.shape[0])
+            olrow = np.int32(oloss_out.shape[1])
+            olcol = np.int32(oloss_out.shape[2])
+        else:
+            oloss_out_size = np.int32(1)
+            olrow = np.int32(oloss_out.shape[0])
+            olcol = np.int32(oloss_out.shape[1])
+               
+               
+        #CONVERTING ORIGINAL FILTER DIMENSIONS TO INT32
+        if(ofilter.ndim == 3):
+            ofilter_size = np.int32(ofilter.shape[0])
+            frow = np.int32(ofilter.shape[1])
+            fcol = np.int32(ofilter.shape[2])
+        else:
+            ofilter_size = np.int32(1)
+            frow = np.int32(ofilter.shape[0])
+            fcol = np.int32(ofilter.shape[1])
+               
+               
+        #CONVERTING NEW LOSS CHANGE/OUTPUT DIMENSIONS TO INT32
+        if(new_lo_output.ndim == 3):
+            new_lo_output_size = np.int32(new_lo_output.shape[0])
+            nlrow = np.int32(new_lo_output.shape[1])
+            nlcol = np.int32(new_lo_output.shape[2])
+        else:
+            new_lo_output_size = np.int32(1)
+            nlrow = np.int32(new_lo_output.shape[0])
+            nlcol = np.int32(new_lo_output.shape[1])
+            
+        #RUN PARALLELISM ALGORITHM IN C
+        prg4.conv_backprop_loss_o(self.queue, new_lo_output.shape ,None, oloss_out_size, ofilter_size, new_lo_output_size, olrow, olcol, frow, fcol, nlrow, nlcol,cl_a, cl_b, cl_c)
+        
+        #CREATE ARRAY OF CONV IMAGE FILLED WITH ZEROS
+        nl_output = np.zeros_like(new_lo_output,dtype=np.float32)
+        nl_output = np.empty_like(nl_output)
+        
+        #COPY OVER PARALLELISM ALGORITHM RESULT TO CONV IMAGE ARRAY
+        cl.enqueue_copy(self.queue, nl_output , cl_c)
+        
+        #SUMMING ALL FILTER LOSSES FOR EACH ORIGINAL IMAGE
+        nl_output2 = np.split(nl_output,ofilter_size)
+        nl_output2 = np.sum(nl_output2,axis=0)
+        
+        return nl_output2
+        
+        
         
 
     def __init__(self):
@@ -165,8 +412,8 @@ class Convolutional_Neural_Network:
         self.kernel_length = 3
         
         #NUMBER OF FILTERS PER CONVOLUTION LAYER
-        self.num_filtersL1 = 8
-        self.num_filtersL2 = 12
+        self.num_filtersL1 = 2
+        self.num_filtersL2 = 3
         
         #LAYER 1 KERNEL INITIALIZATION
         self.filterL1 = np.random.rand(self.num_filtersL1, self.kernel_height, self.kernel_length)
@@ -222,30 +469,21 @@ class Convolutional_Neural_Network:
         
     #FORWARD PASS
     def Feature_Learning(self,input_img):
+    
+    
+    #LAYER 1 OF FEATURE LEARNING
+    
+    
+        #SETTING THE INPUT IMG
+        self.input_img = input_img
         
         #CALCULATE THE VALUE OF CONVOLUTION LAYER 1
         self.C1_height = self.input_height - self.kernel_height + 1
         self.C1_length = self.input_length - self.kernel_length + 1
         self.C1 = np.zeros((self.num_filtersL1, self.C1_height, self.C1_length))
         
-        #INITIALIZE SUBSET FOR FILTERED IMAGE
-#        filtered_subset = np.zeros((self.kernel_height,self.kernel_length))
-        
-        #RUN THROUGH EACH FILTER
-#        for f in range (self.num_filtersL1):
-#            #RUN THROUGH THE LENGTH OF NEW CONVOLUTION LAYER
-#            for l in range (self.C1_length):
-#                #RUN THROUGH HEIGHT OF NEW CONVOLUTION LAYER
-#                for h in range (self.C1_height):
-#                    #MULTIPYING FILTER TO SLICED IMAGE
-#                    filtered_subset = input_img[h:h+self.kernel_height,l:l+self.kernel_length] * self.filterL1[f]
-#
-#                    #SUM OF FILTERED IMAGE SUBSET
-#                    self.C1[f,h,l] = np.sum(filtered_subset)
-                    
         #CONVOLUTION FUNCTION PARALLELISM
         self.C1 = self.conv_parallelism(self.filterL1,input_img,self.C1)
-
 
         #ReLU ACTIVATION FUNCTION
         self.activ_C1 = self.ReLU(self.C1)
@@ -256,41 +494,20 @@ class Convolutional_Neural_Network:
         self.P1 = np.zeros((self.num_filtersL1, self.P1_height, self.P1_length))
         
         #RUN THROUGH EACH CONVOLUTION FOR LAYER 1
-        for f in range (self.num_filtersL1):
-            #RUN THROUGH THE LENGTH OF NEW POOLING LAYER
-            for l in range (self.P1_length):
-                #RUN THROUGH HEIGHT OF NEW POOLING LAYER
-                for h in range (self.P1_height):
-                    #MAX VALUE OF POOL CALCULATION
-                    h_iter = h * self.pool_height
-                    l_iter = l * self.pool_length
-                    self.P1[f,h,l] = self.max_pooling(self.activ_C1[f, h_iter:h_iter+self.pool_height,l_iter:l_iter+self.pool_length])
-                    
+        self.P1 = self.parallel_pooling(self.activ_C1,self.P1)
         
+        
+        
+    #LAYER 2 OF FEATURE LEARNING
+    
+    
         #CALCULATE THE VALUE OF CONVOLUTION LAYER 2
         self.C2_height = int(self.P1_height - self.kernel_height + 1)
         self.C2_length = int(self.P1_length - self.kernel_length + 1)
         self.C2 = np.zeros((self.num_filtersL1 * self.num_filtersL2, self.C2_height, self.C2_length))
         
-        #INITIALIZE SUBSET FOR FILTERED IMAGE
-#        filtered_subset = np.zeros((self.kernel_height,self.kernel_length))
-        
-        #RUN THROUGH EACH FILTER
-#        for f in range (self.num_filtersL1 * self.num_filtersL2):
-#            #RUN THROUGH THE LENGTH OF NEW CONVOLUTION LAYER
-#            for l in range (self.C2_length):
-#                #RUN THROUGH HEIGHT OF NEW CONVOLUTION LAYER
-#                for h in range (self.C2_height):
-#                    #MULTIPYING FILTER TO SLICED IMAGE
-#                    filtered_subset = self.P1[int(f/self.num_filtersL2),h:h+self.kernel_height,l:l+self.kernel_length] * self.filterL2[int(f/self.num_filtersL1)]
-#
-#                    #SUM OF FILTERED IMAGE SUBSET
-#                    self.C2[f,h,l] = np.sum(filtered_subset)
-                    
-        
         #CONVOLUTION FUNCTION PARALLELISM
         self.C2 = self.conv_parallelism(self.filterL2,self.P1,self.C2)
-
 
         #ReLU ACTIVATION FUNCTION
         self.activ_C2 = self.ReLU(self.C2)
@@ -301,16 +518,11 @@ class Convolutional_Neural_Network:
         self.P2 = np.zeros((self.num_filtersL1 * self.num_filtersL2, self.P2_height, self.P2_length))
         
         #RUN THROUGH EACH CONVOLUTION FOR LAYER 2
-        for f in range (self.num_filtersL1 * self.num_filtersL2):
-            #RUN THROUGH THE LENGTH OF NEW POOLING LAYER
-            for l in range (self.P2_length):
-                #RUN THROUGH HEIGHT OF NEW POOLING LAYER
-                for h in range (self.P2_height):
-                    #MAX VALUE OF POOL CALCULATION
-                    h_iter = h * self.pool_height
-                    l_iter = l * self.pool_length
-                    self.P2[f,h,l] = self.max_pooling(self.activ_C2[f, h_iter:h_iter+self.pool_height,l_iter:l_iter+self.pool_length])
-
+        self.P2 = self.parallel_pooling(self.activ_C2,self.P2)
+        
+    
+    #FLATTEN LAYER CREATION
+    
         self.flatten_layer = self.P2.flatten()
         
         return self.flatten_layer
@@ -336,10 +548,13 @@ class Convolutional_Neural_Network:
     #BACKWARD PASS
     def Backpropogation(self,cost_vec,learning_rate):
         
+        
+    #OUTPUT - HIDDEN LAYER 1
+    
+    
         #CROSS ENTROPY LOSS
         error = -1 * (cost_vec/self.o1)
-        
-        #OUTPUT - HIDDEN LAYER 1
+    
         #SOFTMAX DERIVATION
         dsoftmax = self.d_softmax(self.z1_bias)
         
@@ -351,7 +566,11 @@ class Convolutional_Neural_Network:
         #BIAS CHANGE CALCULATION
         self.c_b2 = sum_jacobian
         
-        #HIDDEN LAYER 1 - FULLY CONNECTED LAYER INPUT
+        
+        
+    #HIDDEN LAYER 1 - FULLY CONNECTED LAYER INPUT
+    
+    
         #SIGMOID DERIVATION
         dsigmoid = self.d_sigmoid(self.h1)
         
@@ -367,13 +586,15 @@ class Convolutional_Neural_Network:
         #BIAS CHANGE CALCULATION
         self.c_b1 = dcost_actinput
         
-        #BACKWARD PASS FEATURE LEARNING
+    
+    
+    #BACKWARD PASS FEATURE LEARNING
+    
+    
         #ERROR CALCULATION
         bp_error = fin_error * self.w1
         bp_error = np.sum(bp_error,axis = 1)
-        
         bp_error = bp_error.reshape(self.num_filtersL1 * self.num_filtersL2, self.P2_height, self.P2_length)
-        
         
         #DERIVATIVE OF POOLING LAYER 2 AND ERROR MULTIPLICATION
         dpooling2 = self.dmax_pooling(self.activ_C2,self.P2,bp_error)
@@ -384,59 +605,24 @@ class Convolutional_Neural_Network:
         #DERIVATIVE LOSS TO OUTPUT
         loss2_out = dpooling2 * dRelU_2
         
-        #SUMMING THE LOSS TO HAVE SAME DIMENSIONS AS 1ST SET OF FILTERS
-        loss2_out = np.split(loss2_out,self.num_filtersL1)
-        loss2_out = np.sum(loss2_out,axis=0)
-        
-        
         #FILTER 2 CHANGE INITIALIZATION
-        self.c_filter2 = np.zeros((self.num_filtersL2,self.kernel_height,self.kernel_length))
+        self.c_filter2 = np.zeros((self.num_filtersL1 * self.num_filtersL2, self.kernel_height, self.kernel_length))
         
-        #NUMBER OF FILTERS ITERATION
-#        for f in range (self.num_filtersL2 * self.num_filtersL1):
-#            #LENGTH OF LOSS DERIVATIVE
-#            for l in range (self.kernel_length):
-#                #HEIGHT OF LOSS DERIVATIVE
-#                for h in range (self.kernel_height):
-#                    #LOSS HEIGHT AND LOSS LENGTH
-#                    h_iter = self.P1_height - self.kernel_height + 1
-#                    l_iter = self.P1_length - self.kernel_length + 1
-#
-#                    #MULTIPLYING LOSS TO SLICED IMAGE
-#                    pool_subset2 = self.P1[int(f/self.num_filtersL2),h:h+h_iter,l:l+l_iter] * loss2_out[int(f/self.num_filtersL1),h,l]
-#
-#                    #SUM OF MULTIPLIED LOSS SUBSET
-#                    self.c_filter2[int(f/self.num_filtersL1),h,l] = np.sum(pool_subset2)
-        
-
         #CONVOLUTION FUNCTION PARALLELISM
-        self.c_filter2 = self.conv_parallelism(loss2_out,self.P1,self.c_filter2)
-
+        self.c_filter2 = self.backprop_conv(loss2_out,self.P1,self.c_filter2)
         
         #NEED TO PAD LOSS
-        padded_loss2 = np.pad(loss2_out,self.kernel_length-1,mode='constant')
+        padded_loss2 = np.pad(loss2_out,((0,0),(self.kernel_length-1,self.kernel_length-1),(self.kernel_length-1,self.kernel_length-1)),constant_values=0)
         
         #ERROR BEFORE CONVOLUTION 2
-        C2_error = np.zeros((self.num_filtersL1,self.P1_height,self.P1_length))
+        C2_error = np.zeros((self.num_filtersL1*self.num_filtersL2,self.P1_height,self.P1_length))
         
-        #ITERATION THROUGH FILTERS
-#        for f in range (self.num_filtersL1 * self.num_filtersL2):
-#            #LENGTH OF FILTER
-#            for l in range (self.P1_length):
-#                #HEIGHT OF FILTER
-#                for h in range (self.P1_height):
-#                    #MULTIPYING FILTER TO SLICED IMAGE LOSS
-#                    loss_subset2 = padded_loss2[int(f/self.num_filtersL1),h:h+self.kernel_height,l:l+self.kernel_length] * self.filterL2[int(f/self.num_filtersL1)]
-#
-#                    #THE C2_error MAY HAVE AN ERROR IN f/self.num_filtersL2------------------------------------------------------
-#                    #SUM OF FILTERED IMAGE SUBSET
-#                    C2_error[int(f/self.num_filtersL2),h,l] = np.sum(loss_subset2)
-                    
+        #ROTATE FILTER
+        rotated_filterL2 = np.rot90(self.filterL2,2,(1,2))
         
         #CONVOLUTION FUNCTION PARALLELISM
-        C2_error = self.conv_parallelism(self.filterL2,padded_loss2,C2_error)
-
-                     
+        C2_error = self.conv_backprop_loss(padded_loss2,self.filterL2,C2_error)
+        
         #DERIVATIVE OF POOLING LAYER 2 AND ERROR MULTIPLICATION
         dpooling = self.dmax_pooling(self.activ_C1,self.P1,C2_error)
         
@@ -446,30 +632,17 @@ class Convolutional_Neural_Network:
         #DERIVATIVE LOSS TO OUTPUT
         loss_out = dpooling * dRelU
         
+        #FILTER 2 CHANGE INITIALIZATION
+        self.c_filter = np.zeros((self.num_filtersL1, self.kernel_height, self.kernel_length))
         
-        #FILTER 1 CHANGE INITIALIZATION
-        self.c_filter = np.zeros((self.num_filtersL1,self.kernel_height,self.kernel_length))
-        
-        #NUMBER OF FILTERS ITERATION
-#        for f in range (self.num_filtersL1):
-#            #LENGTH OF LOSS DERIVATIVE
-#            for l in range (self.kernel_length):
-#                #HEIGHT OF LOSS DERIVATIVE
-#                for h in range (self.kernel_height):
-#                    h_iter = self.input_height - self.kernel_height + 1
-#                    l_iter = self.input_length - self.kernel_length + 1
-#
-#                    #MULTIPLYING LOSS TO SLICED IMAGE
-#                    pool_subset = self.P1[f,h:h + h_iter,l:l+ l_iter] * loss_out[f,h,l]
-#
-#                    #SUM OF MULTIPLIED LOSS SUBSET
-#                    self.c_filter[f,h,l] = np.sum(pool_subset)
-
-
         #CONVOLUTION FUNCTION PARALLELISM
-        self.c_filter = self.conv_parallelism(loss_out,self.P1,self.c_filter)
-        
-                    
+        self.c_filter = self.backprop_conv(loss_out,self.input_img,self.c_filter)
+
+
+    
+    #SETUP OF CLASSIFICATION WEIGHTS/FILTERS
+     
+     
         #CLASSIFICATION WEIGHT CALCULATION
         self.w1 = self.w1 - (learning_rate * self.c_w1)
         self.w2 = self.w2 - (learning_rate * self.c_w2)
@@ -610,7 +783,7 @@ class Convolutional_Neural_Network:
             os.remove('lego_blocks.npy')
         
             #DELETE EXTRA FILE
-            os.rmdir(file_path)
+#            os.rmdir(file_path)
         
         except OSError as e:
             print("FILE DOESNT EXIST FOR DELETION")
@@ -713,6 +886,15 @@ def main():
                 
 if __name__ == "__main__":
     main()
+#    test = np.array([[[9,1,1],[1,1,1],[1,1,3]],[[8,1,1],[1,1,1],[1,1,2]],[[7,1,1],[1,1,1],[1,1,3]]])
+#    print(test)
+#    print()
+#    test = np.pad(test,((0,0),(1,1),(1,1)),constant_values=0)
+#    test2 = np.rot90(test,2,(1,2))
+#    print(test)
+#    print()
+#    print("TEST2")
+#    print(test2)
 
 
  
