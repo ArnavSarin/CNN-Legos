@@ -383,6 +383,25 @@ print("\nAFTER POOL")
 print(aft_pool.shape)
 print(aft_pool)
 
+
+benchmark4 = datetime.datetime.now() - t0
+print('OpenCL Multiplication: ' + str(benchmark4))
+
+
+
+
+
+#MAX POOLING DERIVATIVE PARALLELISM
+
+aft_p_loss = np.arange(4*50*50).reshape(4,50,50).astype(np.float32)
+pre_p_loss = np.zeros((4,100,100)).astype(np.float32)
+
+print("\nAFTER POOLING LOSS")
+print(aft_p_loss)
+
+pool_x = pool_x.astype(np.int32)
+pool_y = pool_y.astype(np.int32)
+
 print("\nX VALUE POOL")
 print(pool_x.shape)
 print(pool_x)
@@ -391,6 +410,56 @@ print("\nY VALUE POOL")
 print(pool_y.shape)
 print(pool_y)
 
+mf = cl.mem_flags
+cl_a = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf = pool_x.flatten())
+cl_b = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf = pool_y.flatten())
+cl_c = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf = aft_p_loss.flatten())
+cl_d = cl.Buffer(ctx, mf.WRITE_ONLY, pre_p_loss.flatten().nbytes)
 
-benchmark4 = datetime.datetime.now() - t0
-print('OpenCL Multiplication: ' + str(benchmark4))
+
+prg4 = cl.Program(ctx, """
+__kernel void max_pooling_deriv_parallel(int pool_row, int pool_col, int aftprow, int aftpcol, int preprow, int prepcol,  __global int * pool_x, __global int * pool_y, __global float * aft_p_loss, __global float * pre_p_loss)
+{
+
+    int i = get_global_id(0);
+    int j = get_global_id(1);
+    int k = get_global_id(2);
+
+
+    if( (j == pool_y[(i * aftprow * aftpcol) + ((j/pool_row)*aftpcol) + (k/pool_col)])  &&  (k == pool_x[(i * aftprow * aftpcol) + ((j/pool_row)*aftpcol) + (k/pool_col)]) )
+    {
+        pre_p_loss[(i * preprow * prepcol) + (j * prepcol) + k] = aft_p_loss[(i * aftprow * aftpcol) + ((j/pool_row)*aftpcol) + (k/pool_col)];
+    }
+    else
+    {
+        pre_p_loss[(i * preprow * prepcol) + (j * prepcol) + k] = 0;
+    }
+        
+    
+}
+""").build()
+
+(pool_row, pool_col, aftprow, aftpcol, prepcol, preprow) = (2,2,50,50,100,100)
+
+pool_row = np.int32(pool_row)
+pool_col = np.int32(pool_col)
+aftprow = np.int32(aftprow)
+aftpcol = np.int32(aftpcol)
+preprow = np.int32(preprow)
+prepcol = np.int32(prepcol)
+
+t0 = datetime.datetime.now()
+
+prg4.max_pooling_deriv_parallel(queue, pre_p_loss.shape ,None, pool_row, pool_col, aftprow, aftpcol, preprow, prepcol, cl_a, cl_b, cl_c, cl_d)
+
+pre_p_loss = np.zeros((4,100,100), dtype=np.float32)
+pre_p_loss = np.empty_like(pre_p_loss)
+cl.enqueue_copy(queue, pre_p_loss , cl_d)
+
+print("\nPRE POOLING LOSS")
+print(pre_p_loss.shape)
+print(pre_p_loss)
+print(pre_p_loss[0][1][99])
+
+benchmark6 = datetime.datetime.now() - t0
+print('MAX POOLING DERIVATIVE: ' + str(benchmark6))

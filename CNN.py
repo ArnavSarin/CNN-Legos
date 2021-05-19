@@ -248,18 +248,22 @@ class Convolutional_Neural_Network:
     
     
     
-    def parallel_pooling(self, pre_pool, aft_pool):
+    def parallel_pooling(self, pre_pool, aft_pool, pool_x, pool_y):
     
         #CONVERT MATRIX TO FLOAT32
         pre_pool = pre_pool.astype(np.float32)
         aft_pool = aft_pool.astype(np.float32)
+        pool_x = pool_x.astype(np.float32)
+        pool_y = pool_y.astype(np.float32)
         
         mf = cl.mem_flags
         cl_a = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf = pre_pool.flatten())
         cl_b = cl.Buffer(self.ctx, mf.WRITE_ONLY, aft_pool.flatten().nbytes)
+        cl_c = cl.Buffer(self.ctx, mf.WRITE_ONLY, pool_x.flatten().nbytes)
+        cl_d = cl.Buffer(self.ctx, mf.WRITE_ONLY, pool_y.flatten().nbytes)
         
         prg3 = cl.Program(self.ctx, """
-        __kernel void pooling_parallelism( int pool_row, int pool_col,int prep_row, int prep_col, int aftp_row, int aftp_col,  __global float * pre_pool, __global float * aft_pool)
+        __kernel void pooling_parallelism( int pool_row, int pool_col,int prep_row, int prep_col, int aftp_row, int aftp_col,  __global float * pre_pool, __global float * aft_pool, __global float * pool_x, __global float * pool_y)
         {
 
             int i = get_global_id(0);
@@ -276,6 +280,8 @@ class Convolutional_Neural_Network:
                     if( aft_pool[(i * (aftp_col * aftp_row)) + (j * aftp_col) + k ] <= pre_pool[((i * (prep_col * prep_row)) + (row * prep_col + col)+(j*pool_row*prep_col+k*pool_col))])
                     {
                         aft_pool[(i * (aftp_col * aftp_row)) + (j * aftp_col) + k ] = pre_pool[((i * (prep_col * prep_row)) + (row * prep_col + col)+(j*pool_row*prep_col+k*pool_col))];
+                        pool_y[(i * (aftp_col * aftp_row)) + (j * aftp_col) + k ] = (j*pool_row) + row;
+                        pool_x[(i * (aftp_col * aftp_row)) + (j * aftp_col) + k ] = (k*pool_col) + col;
                     }
                 }
             }
@@ -307,13 +313,14 @@ class Convolutional_Neural_Network:
             
             
         #RUN PARALLELISM ALGORITHM IN C
-        prg3.pooling_parallelism(self.queue, aft_pool.shape ,None, np.int32(self.pool_length), np.int32(self.pool_height), prep_row, prep_col, aftp_row, aftp_col, cl_a, cl_b)
+        prg3.pooling_parallelism(self.queue, aft_pool.shape ,None, np.int32(self.pool_length), np.int32(self.pool_height), prep_row, prep_col, aftp_row, aftp_col, cl_a, cl_b, cl_c, cl_d)
     
         #COPY OVER PARALLELISM ALGORITHM RESULT TO CONV IMAGE ARRAY
         cl.enqueue_copy(self.queue, aft_pool , cl_b)
+        cl.enqueue_copy(self.queue, pool_x , cl_c)
+        cl.enqueue_copy(self.queue, pool_y , cl_d)
         
-        
-        return aft_pool
+        return aft_pool, pool_x, pool_y
     
         
     def conv_backprop_loss(self, oloss_out, ofilter, new_lo_output):
@@ -493,8 +500,12 @@ class Convolutional_Neural_Network:
         self.P1_length = int(self.C1_length/ self.pool_length)
         self.P1 = np.zeros((self.num_filtersL1, self.P1_height, self.P1_length))
         
+        #INITIALIZE DEFAULT X AND Y COORDINATES FOR POOLING MAXIMUM IN LAYER 1
+        self.p1_x = np.zeros(self.P1.shape).astype(np.float32)
+        self.p1_y = np.zeros(self.P1.shape).astype(np.float32)
+        
         #RUN THROUGH EACH CONVOLUTION FOR LAYER 1
-        self.P1 = self.parallel_pooling(self.activ_C1,self.P1)
+        self.P1, self.p1_x, self.p1_y = self.parallel_pooling(self.activ_C1,self.P1, self.p1_x, self.p1_y)
         
         
         
@@ -517,8 +528,12 @@ class Convolutional_Neural_Network:
         self.P2_length = int(self.C2_length/self.pool_length)
         self.P2 = np.zeros((self.num_filtersL1 * self.num_filtersL2, self.P2_height, self.P2_length))
         
+        #INITIALIZE DEFAULT X AND Y COORDINATES FOR POOLING MAXIMUM IN LAYER 2
+        self.p2_x = np.zeros(self.P2.shape).astype(np.float32)
+        self.p2_y = np.zeros(self.P2.shape).astype(np.float32)
+        
         #RUN THROUGH EACH CONVOLUTION FOR LAYER 2
-        self.P2 = self.parallel_pooling(self.activ_C2,self.P2)
+        self.P2, self.p2_x, self.p2_y = self.parallel_pooling(self.activ_C2,self.P2, self.p2_x, self.p2_y)
         
     
     #FLATTEN LAYER CREATION
